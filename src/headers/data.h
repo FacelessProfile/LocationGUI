@@ -4,31 +4,24 @@
 #include <mutex>
 
 struct TelemetryData {
-    std::string lat;
-    std::string lon;
-    std::string signal;
-    std::string timestamp;
+    std::string lat, lon, alt, accuracy, signal, timestamp, net_type, cell_info;
 };
 
 class SharedBuffer {
 public:
-    SharedBuffer() = default;
+    SharedBuffer() : flags("1111") {}
+    
     void addData(const TelemetryData& d) {
         std::lock_guard<std::mutex> lock(mtx);
         history.push_back(d);
     }
+
     std::vector<TelemetryData> consumeNewData() {
         std::lock_guard<std::mutex> lock(mtx);
         if (history.empty()) return {};
-        
         std::vector<TelemetryData> temp = std::move(history);
         history.clear(); 
         return temp;
-    }
-
-    std::vector<TelemetryData> getHistoryCopy() {
-        std::lock_guard<std::mutex> lock(mtx);
-        return history;
     }
 
     void setInitialHistory(const std::vector<TelemetryData>& history_data) {
@@ -36,7 +29,18 @@ public:
         history = history_data;
     }
 
+    void setFlags(const std::string& new_flags) {
+        std::lock_guard<std::mutex> lock(mtx);
+        flags = new_flags;
+    }
+
+    std::string getFlags() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return flags;
+    }
+
 private:
     std::mutex mtx;
     std::vector<TelemetryData> history;
+    std::string flags; 
 };
