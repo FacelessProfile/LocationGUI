@@ -7,6 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(PkgConfig REQUIRED)
 find_package(OpenGL REQUIRED)
 find_package(SDL2 REQUIRED)
+find_package(CURL REQUIRED)
 
 pkg_check_modules(POSTGRES REQUIRED libpq)
 pkg_check_modules(ZMQ REQUIRED libzmq)
@@ -17,6 +18,9 @@ set(APP_SOURCES
     src/main.cpp
     src/network.cpp
     src/GUI.cpp
+    src/MapManager.cpp
+    src/MapWindow.cpp
+    src/AltitudeService.cpp
 )
 
 set(IMGUI_DIR third_party/imgui)
@@ -48,6 +52,7 @@ target_include_directories(telemetry_app PRIVATE
     ${GLEW_INCLUDE_DIRS}
     ${POSTGRES_INCLUDE_DIRS}
     ${ZMQ_INCLUDE_DIRS}
+    ${CURL_INCLUDE_DIRS}
 )
 
 target_link_libraries(telemetry_app PRIVATE
@@ -56,6 +61,7 @@ target_link_libraries(telemetry_app PRIVATE
     ${GLEW_LIBRARIES}
     ${POSTGRES_LIBRARIES}
     ${ZMQ_LIBRARIES}
+    ${CURL_LIBRARIES}
     pthread
     dl
 )

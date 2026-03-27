@@ -5,6 +5,8 @@
 
 struct TelemetryData {
     std::string lat, lon, alt, accuracy, signal, timestamp, net_type, cell_info;
+    std::string band, cell_id, pci, tac, mcc, mnc, rsrq, rssi, snr, cqi;
+    std::string earfcn;
 };
 
 class SharedBuffer {
@@ -38,9 +40,19 @@ public:
         std::lock_guard<std::mutex> lock(mtx);
         return flags;
     }
+    void setMapData(const std::vector<TelemetryData>& data) {
+        std::lock_guard<std::mutex> lock(mtx);
+        map_data = data;
+    }
+
+    std::vector<TelemetryData> getMapData() {
+        std::lock_guard<std::mutex> lock(mtx);
+        return map_data;
+    }
 
 private:
     std::mutex mtx;
     std::vector<TelemetryData> history;
     std::string flags; 
+    std::vector<TelemetryData> map_data;
 };
