@@ -36,6 +36,9 @@ MapWindow::MapWindow(Loader l) : loader(std::move(l)) {
 }
 
 MapWindow::~MapWindow() {
+    if (heatmapJob) {
+        heatmapJob->abort.store(true, std::memory_order_relaxed);
+    }
     ClearHeatmapTextures();
 }
 
@@ -124,13 +127,37 @@ ImU32 MapWindow::ColorForHeatmapValue(HeatmapCriterion c, double v, double altMi
     case HeatmapCriterion::Altitude:
     default:
         if (!std::isfinite(v) || !std::isfinite(altMin) || !std::isfinite(altMax)) return IM_COL32(100, 100, 100, 255);
-        if (std::abs(altMax - altMin) < 1e-3) return IM_COL32(180, 180, 60, 255);
+        if (std::abs(altMax - altMin) < 1e-3) return IM_COL32(0, 190, 255, 255);
         {
             float t = static_cast<float>((v - altMin) / (altMax - altMin));
             t = std::clamp(t, 0.0f, 1.0f);
-            ImU32 low = IM_COL32(0, 80, 200, 255);
-            ImU32 high = IM_COL32(255, 60, 40, 255);
-            return lerpColor(low, high, t);
+            
+            struct Stop { float pos; uint8_t r, g, b; };
+            static constexpr Stop stops[] = {
+                {0.00f,   0, 190, 255},   // Синий / Голубой (Низменности)
+                {0.14f,   0, 230, 140},   // Светло-зеленый
+                {0.30f,  80, 235,  40},   // Зеленый (Lime)
+                {0.47f, 200, 240,   0},   // Желто-зеленый
+                {0.62f, 255, 195,   0},   // Янтарный / Желтый
+                {0.76f, 255, 105,   0},   // Оранжевый
+                {0.88f, 255,  25,  10},   // Красный
+                {1.00f, 255, 200, 200},   // Бело-розовый (Пики гор)
+            };
+            static constexpr int nStops = static_cast<int>(sizeof(stops) / sizeof(stops[0]));
+
+            int lo = 0, hi = nStops - 2;
+            for (int i = 0; i < nStops - 1; ++i) {
+                if (t <= stops[i + 1].pos) { lo = i; hi = i + 1; break; }
+            }
+            const float span = stops[hi].pos - stops[lo].pos;
+            const float ft   = (span < 1e-6f) ? 0.0f : (t - stops[lo].pos) / span;
+
+            return IM_COL32(
+                lerpChannel(stops[lo].r, stops[hi].r, ft),
+                lerpChannel(stops[lo].g, stops[hi].g, ft),
+                lerpChannel(stops[lo].b, stops[hi].b, ft),
+                255
+            );
         }
     }
 }
@@ -244,7 +271,7 @@ void MapWindow::RefreshHeatmapComboLists() {
         if (p.hasPci) pciSet.insert(p.pciVal);
     }
     heatmapPciChoices.assign(pciSet.begin(), pciSet.end());
-    heatmapPciChoices.insert(heatmapPciChoices.begin(), -1); // -1 означает "Все PCI"
+    heatmapPciChoices.insert(heatmapPciChoices.begin(), -1); 
     if (heatmapPciChoiceIdx >= static_cast<int>(heatmapPciChoices.size())) heatmapPciChoiceIdx = 0;
 
     std::set<std::string> earSet;
@@ -267,8 +294,11 @@ void MapWindow::Reload() {
 }
 
 void MapWindow::EnsureHeatmapReady() {
+    if (!useHeatmap || points.empty() || heatmapEarfcnChoices.empty()) return;
+    if (!heatmapTextures.empty() || heatmapJob) return; 
+
     LoadHeatmapTiles();
-    if (useHeatmap && !points.empty() && heatmapTextures.empty() && !heatmapEarfcnChoices.empty()) {
+    if (heatmapTextures.empty()) {
         GenerateHeatmapTiles();
     }
 }
@@ -309,7 +339,7 @@ std::string MapWindow::HeatmapCacheDir() const {
     if (heatmapEarfcnChoices.empty()) return {};
     const std::string& ear = heatmapEarfcnChoices[heatmapEarfcnChoiceIdx];
     std::ostringstream oss;
-    oss << "tiles_cache/heatmap/" << kHeatmapBaseZoom << "/";
+    oss << "tiles_cache/heatmap/" << kHeatmapComputeZoom << "/"; 
     int pci = heatmapPciChoices.empty() ? -1 : heatmapPciChoices[heatmapPciChoiceIdx];
     
     if (pci == -1) oss << "pci_all";
@@ -351,14 +381,61 @@ void MapWindow::LoadHeatmapTiles() {
     }
 }
 
-// =====================================================================================
-// PROFESSIONAL GIS / TELECOM HEATMAP GENERATOR
-// LTE / NR RF COVERAGE INTERPOLATION
-// IDW + QUARTIC KERNEL + LOG DOMAIN AVERAGING + HD TILES
-// =====================================================================================
+void MapWindow::UploadPendingHeatmapTiles() {
+    if (!heatmapJob) return;
+
+    {
+        std::unique_lock<std::mutex> lk(heatmapJob->mtx, std::try_to_lock);
+        if (lk.owns_lock()) {
+            while (!heatmapJob->pendingTiles.empty()) {
+                auto [id, rgba] = std::move(heatmapJob->pendingTiles.front());
+                heatmapJob->pendingTiles.pop_front();
+                lk.unlock();
+
+                auto it = heatmapTextures.find(id);
+                if (it != heatmapTextures.end()) {
+                    glDeleteTextures(1, &it->second);
+                    heatmapTextures.erase(it);
+                }
+
+                GLuint tex;
+                glGenTextures(1, &tex);
+                glBindTexture(GL_TEXTURE_2D, tex);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
+                             kHeatmapTextureSize, kHeatmapTextureSize, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+                heatmapTextures[id] = tex;
+
+                lk.lock();
+            }
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> lk(heatmapJob->mtx, std::try_to_lock);
+        if (!lk.owns_lock() || !heatmapJob->done) return;
+
+        heatmapLastAltMin       = heatmapJob->altMin;
+        heatmapLastAltMax       = heatmapJob->altMax;
+        heatmapLastSourcePoints = heatmapJob->sourcePoints;
+        heatmapLastTileCount    = static_cast<int>(heatmapTextures.size());
+        heatmapStatusMsg        = heatmapJob->statusMsg;
+    }
+
+    heatmapJob.reset();
+}
 
 void MapWindow::GenerateHeatmapTiles()
 {
+    if (heatmapJob) {
+        heatmapJob->abort.store(true, std::memory_order_relaxed);
+    }
+    heatmapJob.reset();
+
     heatmapLastSourcePoints = 0;
     heatmapLastTileCount = 0;
 
@@ -368,619 +445,324 @@ void MapWindow::GenerateHeatmapTiles()
     }
 
     ClearHeatmapTextures();
+    heatmapStatusMsg = "Heatmap: computing...";
 
-
+    auto job = std::make_shared<HeatmapAsyncJob>();
+    heatmapJob = job;
 
     const double scaleBase =
-    static_cast<double>(kTileSize) *
-    double(1LL << kHeatmapComputeZoom);
+        static_cast<double>(kTileSize) *
+        double(1LL << kHeatmapComputeZoom);
 
     const float scaleFactor =
         static_cast<float>(kHeatmapTextureSize) / kTileSize;
 
     const HeatmapCriterion crit = heatmapCriterion;
+    const bool isAltitude = (crit == HeatmapCriterion::Altitude);
+    
+    const float radiusM = isAltitude ? std::max(heatmapInterpRadiusM, 50.0f) : std::clamp(heatmapInterpRadiusM, 15.0f, 45.0f);
+    const double p_power = isAltitude ? 1.5 : 1.45;
 
-    const bool isAltitude =
-        (crit == HeatmapCriterion::Altitude);
-
-    // =========================================================================
-    // PROFESSIONAL GIS PARAMETERS
-    // =========================================================================
-
-    const float radiusM =
-        isAltitude
-            ? 100.0f
-            : std::clamp(heatmapInterpRadiusM, 15.0f, 45.0f);
-
-    const double p_power =
-        isAltitude
-            ? 1.0
-            : 1.45;
-
-    // =========================================================================
-    // LOG DOMAIN CONVERSION
-    // =========================================================================
-
-    auto MetricToLinear =
-        [](HeatmapCriterion criterion, double val) -> double
-    {
-        if (criterion == HeatmapCriterion::Altitude)
-            return val;
-
+    auto MetricToLinear = [](HeatmapCriterion criterion, double val) -> double {
+        if (criterion == HeatmapCriterion::Altitude) return val;
         return std::pow(10.0, val / 10.0);
     };
 
-    auto LinearToMetric =
-        [](HeatmapCriterion criterion, double val) -> double
-    {
-        if (criterion == HeatmapCriterion::Altitude)
-            return val;
-
-        if (val <= 1e-20)
-            return -140.0;
-
+    auto LinearToMetric = [](HeatmapCriterion criterion, double val) -> double {
+        if (criterion == HeatmapCriterion::Altitude) return val;
+        if (val <= 1e-20) return -140.0;
         return 10.0 * std::log10(val);
     };
 
-    // =========================================================================
-    // ALTITUDE QUANTILE NORMALIZATION
-    // =========================================================================
-
-    std::vector<double> validValues;
-
-    for (const auto& p : points)
-    {
-        if (!PointMatchesHeatmapFilter(p))
-            continue;
-
-        double v = 0.0;
-
-        if (GetPointMetric(p, crit, v))
-            validValues.push_back(v);
-    }
-
-    if (validValues.empty()) {
-        heatmapStatusMsg = "Heatmap: no valid source points.";
-        return;
-    }
-
-    std::sort(validValues.begin(), validValues.end());
-
-    if (isAltitude)
-    {
-        size_t lowIdx =
-            static_cast<size_t>(
-                validValues.size() * 0.01);
-
-        size_t highIdx =
-            static_cast<size_t>(
-                validValues.size() * 0.99);
-
-        heatmapLastAltMin = validValues[lowIdx];
-        heatmapLastAltMax = validValues[highIdx];
-
-        if (std::abs(heatmapLastAltMax - heatmapLastAltMin) < 0.01)
-            heatmapLastAltMax = heatmapLastAltMin + 1.0;
-    }
-
-    // =========================================================================
-    // TILE STORAGE
-    // =========================================================================
-
-    std::map<
-        std::pair<int, int>,
-        std::vector<HeatmapCell>
-    > tileGrids;
-
-    // =========================================================================
-    // MAIN IDW INTERPOLATION
-    // =========================================================================
-
-    for (const auto& p : points)
-    {
-        if (!PointMatchesHeatmapFilter(p))
-            continue;
-
-        double metric = 0.0;
-
-        if (!GetPointMetric(p, crit, metric))
-            continue;
-
-        ++heatmapLastSourcePoints;
-
-        const double mpp =
-            MetersPerPixelAtLat(
-                p.lat,
-                kHeatmapComputeZoom);
-
-        if (mpp <= 1e-12)
-            continue;
-
-        const float Rpx =
-            static_cast<float>(radiusM / mpp);
-
-        if (Rpx < 1.0f)
-            continue;
-
-        // =====================================================================
-        // HD COORDINATES
-        // =====================================================================
-
-        const float px =
-            static_cast<float>(p.worldX * scaleBase)
-            * scaleFactor;
-
-        const float py =
-            static_cast<float>(p.worldY * scaleBase)
-            * scaleFactor;
-
-        const float RpxHD =
-            Rpx * scaleFactor;
-
-        const float R2HD =
-            RpxHD * RpxHD;
-
-        const int startX =
-            static_cast<int>(std::floor(px - RpxHD));
-
-        const int endX =
-            static_cast<int>(std::ceil(px + RpxHD));
-
-        const int startY =
-            static_cast<int>(std::floor(py - RpxHD));
-
-        const int endY =
-            static_cast<int>(std::ceil(py + RpxHD));
-
-        const double metricLinear =
-            MetricToLinear(crit, metric);
-
-        // =====================================================================
-        // LOCAL PLANAR APPROXIMATION
-        // MUCH FASTER THAN HAVERSINE
-        // =====================================================================
-
-        const double metersPerDegLat = 111320.0;
-
-        const double metersPerDegLon =
-            std::cos(p.lat * kPi / 180.0)
-            * 111320.0;
-
-        for (int y = startY; y <= endY; ++y)
-        {
-            const float dy =
-                static_cast<float>(y) - py;
-
-            for (int x = startX; x <= endX; ++x)
-            {
-                const float dx =
-                    static_cast<float>(x) - px;
-
-                const float d2 =
-                    dx * dx + dy * dy;
-
-                if (d2 > R2HD)
-                    continue;
-
-                // =============================================================
-                // PIXEL -> WORLD
-                // =============================================================
-
-                double pixelWorldX =
-                    (static_cast<double>(x) / scaleFactor)
-                    / scaleBase;
-
-                double pixelWorldY =
-                    (static_cast<double>(y) / scaleFactor)
-                    / scaleBase;
-
-                // =============================================================
-                // WORLD -> GEO
-                // =============================================================
-
-                double pixLon =
-                    pixelWorldX * 360.0 - 180.0;
-
-                double e =
-                    std::exp(
-                        (0.5 - pixelWorldY)
-                        * 2.0
-                        * kPi);
-
-                double pixLat =
-                    R_TO_D(
-                        std::atan(
-                            0.5 * (e - 1.0 / e)));
-
-                // =============================================================
-                // FAST LOCAL METRIC DISTANCE
-                // =============================================================
-
-                double dxm =
-                    (pixLon - p.lon)
-                    * metersPerDegLon;
-
-                double dym =
-                    (pixLat - p.lat)
-                    * metersPerDegLat;
-
-                double dm =
-                    std::sqrt(
-                        dxm * dxm
-                        + dym * dym);
-
-                if (dm > radiusM)
-                    continue;
-
-                // =============================================================
-                // PROFESSIONAL RF IDW
-                // =============================================================
-
-                double weight;
-
-                if (dm < 0.05)
-                {
-                    weight = 1e12;
-                }
-                else
-                {
-                    // =========================================================
-                    // IDW CORE
-                    // =========================================================
-
-                    weight =
-                        1.0 /
-                        std::pow(dm + 0.1, p_power);
-
-                    // =========================================================
-                    // QUARTIC KERNEL
-                    // =========================================================
-
-                    double rNorm =
-                        dm / static_cast<double>(radiusM);
-
-                    double kernel =
-                        1.0 - (rNorm * rNorm);
-
-                    kernel =
-                        std::max(kernel, 0.0);
-
-                    kernel *= kernel;
-
-                    weight *= kernel;
-                }
-
-                // =============================================================
-                // TILE INDEXING
-                // =============================================================
-
-                int tx =
-                    (x >= 0)
-                        ? (x / kHeatmapTextureSize)
-                        : ((x - (kHeatmapTextureSize - 1))
-                           / kHeatmapTextureSize);
-
-                int ty =
-                    (y >= 0)
-                        ? (y / kHeatmapTextureSize)
-                        : ((y - (kHeatmapTextureSize - 1))
-                           / kHeatmapTextureSize);
-
-                int lx =
-                    x % kHeatmapTextureSize;
-
-                if (lx < 0)
-                    lx += kHeatmapTextureSize;
-
-                int ly =
-                    y % kHeatmapTextureSize;
-
-                if (ly < 0)
-                    ly += kHeatmapTextureSize;
-
-                auto& grid =
-                    tileGrids[{tx, ty}];
-
-                if (grid.empty())
-                {
-                    grid.resize(
-                        kHeatmapTextureSize
-                        * kHeatmapTextureSize,
-                        HeatmapCell{0.0, 0.0});
-                }
-
-                const int idx =
-                    ly * kHeatmapTextureSize + lx;
-
-                // =============================================================
-                // FORMULA (1)
-                // =============================================================
-
-                grid[idx].sumValue +=
-                    metricLinear * weight;
-
-                grid[idx].sumWeights +=
-                    weight;
+    int filterPci = heatmapPciChoices.empty() ? -1 : heatmapPciChoices[heatmapPciChoiceIdx];
+    std::string filterEar = heatmapEarfcnChoices.empty() ? "All" : heatmapEarfcnChoices[heatmapEarfcnChoiceIdx];
+
+    auto snapPoints = points;
+    std::string outDir = HeatmapCacheDir();
+
+    std::thread([
+        job,
+        snapPoints = std::move(snapPoints),
+        crit, isAltitude, radiusM, p_power,
+        filterPci, filterEar = std::move(filterEar),
+        outDir = std::move(outDir),
+        scaleBase, scaleFactor, MetricToLinear, LinearToMetric
+    ]() mutable {
+        auto matchFilter = [&](const PointItem& p) -> bool {
+            if (filterPci != -1 && (!p.hasPci || p.pciVal != filterPci)) return false;
+            if (filterEar != "All" && p.earfcnKey != filterEar) return false;
+            return true;
+        };
+
+        auto getMetric = [](const PointItem& p, HeatmapCriterion c, double& out) -> bool {
+            switch (c) {
+            case HeatmapCriterion::RSRP:     if (!p.hasRsrp) return false; out = p.rsrp;    return true;
+            case HeatmapCriterion::RSRQ:     if (!p.hasRsrq) return false; out = p.rsrqVal; return true;
+            case HeatmapCriterion::RSSI:     if (!p.hasRssi) return false; out = p.rssiVal; return true;
+            case HeatmapCriterion::Altitude: if (!p.hasAlt)  return false; out = p.altM;    return true;
+            default:                                                                          return false;
             }
-        }
-    }
+        };
 
-    // =========================================================================
-    // OUTPUT DIR
-    // =========================================================================
-
-    const std::string outDir =
-        HeatmapCacheDir();
-
-    if (outDir.empty()) {
-        heatmapStatusMsg = "Heatmap cache path empty.";
-        return;
-    }
-
-    std::filesystem::create_directories(outDir);
-
-    // =========================================================================
-    // RASTERIZATION
-    // =========================================================================
-
-    for (auto& [tID, grid] : tileGrids)
-    {
-        std::vector<uint8_t> rgba(
-            kHeatmapTextureSize
-            * kHeatmapTextureSize
-            * 4,
-            0);
-
-        // =====================================================================
-        // PIXEL LOOP
-        // =====================================================================
-
-        for (int i = 0;
-             i < kHeatmapTextureSize * kHeatmapTextureSize;
-             ++i)
-        {
-            if (grid[i].sumWeights < 1e-8)
-                continue;
-
-            // =============================================================
-            // FINAL LOG DOMAIN RESTORE
-            // =============================================================
-
-            const double valLinear =
-                grid[i].sumValue
-                / grid[i].sumWeights;
-
-            const double val =
-                LinearToMetric(
-                    crit,
-                    valLinear);
-
-            // =============================================================
-            // COLOR
-            // =============================================================
-
-            const ImU32 col =
-                ColorForHeatmapValue(
-                    crit,
-                    val,
-                    heatmapLastAltMin,
-                    heatmapLastAltMax);
-
-            // =============================================================
-            // PROFESSIONAL ALPHA MODEL
-            // =============================================================
-
-            uint8_t alpha;
-
-            if (isAltitude)
-            {
-                alpha = 220;
-            }
-            else
-            {
-                float density =
-                    static_cast<float>(
-                        grid[i].sumWeights);
-
-                density =
-                    std::min(
-                        density * 0.55f,
-                        1.0f);
-
-                density =
-                    std::pow(density, 0.65f);
-
-                alpha =
-                    static_cast<uint8_t>(
-                        density * 190.0f);
-            }
-
-            rgba[i * 4 + 0] =
-                static_cast<uint8_t>(
-                    (col >> IM_COL32_R_SHIFT) & 0xFF);
-
-            rgba[i * 4 + 1] =
-                static_cast<uint8_t>(
-                    (col >> IM_COL32_G_SHIFT) & 0xFF);
-
-            rgba[i * 4 + 2] =
-                static_cast<uint8_t>(
-                    (col >> IM_COL32_B_SHIFT) & 0xFF);
-
-            rgba[i * 4 + 3] =
-                alpha;
+        std::vector<double> validValues;
+        for (const auto& p : snapPoints) {
+            if (!matchFilter(p)) continue;
+            double v = 0.0;
+            if (getMetric(p, crit, v)) validValues.push_back(v);
         }
 
-        // =====================================================================
-        // PROFESSIONAL POST BLUR
-        // =====================================================================
+        if (validValues.empty() || job->abort.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lk(job->mtx);
+            job->statusMsg = "Heatmap: no valid source points.";
+            job->done = true;
+            return;
+        }
 
-        std::vector<uint8_t> temp = rgba;
+        std::sort(validValues.begin(), validValues.end());
+        double altMin = 0.0, altMax = 1.0;
 
-        constexpr int blurRadius = 2;
+        if (isAltitude) {
+            size_t lowIdx = static_cast<size_t>(validValues.size() * 0.01);
+            size_t highIdx = static_cast<size_t>(validValues.size() * 0.99);
+            altMin = validValues[lowIdx];
+            altMax = validValues[highIdx];
+            if (std::abs(altMax - altMin) < 0.01) altMax = altMin + 1.0;
+        }
 
-        // horizontal
-        for (int y = 0; y < kHeatmapTextureSize; ++y)
-        {
-            for (int x = 0; x < kHeatmapTextureSize; ++x)
-            {
-                int r = 0;
-                int g = 0;
-                int b = 0;
-                int a = 0;
-                int c = 0;
+        unsigned int numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;
 
-                for (int k = -blurRadius;
-                     k <= blurRadius;
-                     ++k)
-                {
-                    int xx = x + k;
+        std::vector<std::map<std::pair<int, int>, std::vector<HeatmapCell>>> localGrids(numThreads);
+        std::vector<int> localSrcPoints(numThreads, 0);
+        std::vector<std::thread> workers;
 
-                    if (xx < 0 ||
-                        xx >= kHeatmapTextureSize)
-                        continue;
+        size_t totalPoints = snapPoints.size();
+        size_t chunkSize = (totalPoints + numThreads - 1) / numThreads;
 
-                    int idx =
-                        (y * kHeatmapTextureSize + xx) * 4;
+        for (unsigned int t = 0; t < numThreads; ++t) {
+            size_t startIdx = t * chunkSize;
+            size_t endIdx = std::min(startIdx + chunkSize, totalPoints);
+            if (startIdx >= totalPoints) break;
 
-                    r += temp[idx + 0];
-                    g += temp[idx + 1];
-                    b += temp[idx + 2];
-                    a += temp[idx + 3];
+            workers.emplace_back([&, t, startIdx, endIdx]() {
+                for (size_t i = startIdx; i < endIdx; ++i) {
+                    if (job->abort.load(std::memory_order_relaxed)) break;
 
-                    ++c;
+                    const auto& p = snapPoints[i];
+                    if (!matchFilter(p)) continue;
+
+                    double metric = 0.0;
+                    if (!getMetric(p, crit, metric)) continue;
+
+                    ++localSrcPoints[t];
+
+                    const double latRad = p.lat * 3.14159265358979323846 / 180.0;
+                    const double mpdLon = 111320.0 * std::cos(latRad);
+                    const double mpdLat = 111132.92 - 559.82 * std::cos(2.0 * latRad) + 1.175 * std::cos(4.0 * latRad);
+
+                    const double mpp = std::cos(latRad) * 40075016.686 / (256.0 * double(1 << 15));
+                    if (mpp <= 1e-12) continue;
+
+                    int radiusPx = std::max(1, static_cast<int>(std::ceil(radiusM / mpp * scaleFactor)));
+
+                    const float px = static_cast<float>(p.worldX * scaleBase) * scaleFactor;
+                    const float py = static_cast<float>(p.worldY * scaleBase) * scaleFactor;
+
+                    int centerGx = static_cast<int>(std::lround(px));
+                    int centerGy = static_cast<int>(std::lround(py));
+
+                    int x0 = centerGx - radiusPx;
+                    int x1 = centerGx + radiusPx;
+                    int y0 = centerGy - radiusPx;
+                    int y1 = centerGy + radiusPx;
+
+
+const double metricLinear = MetricToLinear(crit, metric);
+
+// Сколько метров приходится на один пиксель сетки
+const double metersPerPx = mpp / scaleFactor;
+const double radiusM2 = static_cast<double>(radiusM) * radiusM;
+
+for (int gy = y0; gy <= y1; ++gy) {
+    // Расстояние по Y в пикселях сетки хитмапа до центра точки
+    double dypx = static_cast<double>(gy) - py;
+    double dym2 = dypx * dypx * metersPerPx * metersPerPx;
+
+    // Быстрая проверка строки: если даже только по Y расстояние превышает радиус пропускаем всю строку
+    if (dym2 > radiusM2) continue;
+
+    for (int gx = x0; gx <= x1; ++gx) {
+        // Расстояние по X в пикселях сетки хитмапа
+        double dxpx = static_cast<double>(gx) - px;
+        double dxm2 = dxpx * dxpx * metersPerPx * metersPerPx;
+
+        double dm2 = dxm2 + dym2;
+        if (dm2 > radiusM2) continue; // Точка вне радиуса интерполяции
+
+        // Считаем корень только для тех пикселей которые точно попали в радиус
+        double dm = std::sqrt(dm2);
+
+        double weight;
+        if (dm < 0.05) {
+            weight = 1e12;
+        } else {
+            weight = 1.0 / std::pow(dm + 0.1, p_power);
+            const double rn = dm / static_cast<double>(radiusM);
+            const double k = std::max(0.0, 1.0 - rn * rn);
+            weight *= k * k;
+        }
+
+        const int tx = (gx >= 0) ? (gx / 1024) : ((gx - 1024 + 1) / 1024);
+        const int ty = (gy >= 0) ? (gy / 1024) : ((gy - 1024 + 1) / 1024);
+
+        int lx = gx % 1024; if (lx < 0) lx += 1024;
+        int ly = gy % 1024; if (ly < 0) ly += 1024;
+
+        auto& grid = localGrids[t][{tx, ty}];
+        if (grid.empty()) grid.resize(1024 * 1024, {0.0, 0.0});
+
+        auto& cell = grid[ly * 1024 + lx];
+        cell.sumValue += metricLinear * weight;
+        cell.sumWeights += weight;
+    }
+}
                 }
+            });
+        }
 
-                int out =
-                    (y * kHeatmapTextureSize + x) * 4;
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
 
-                rgba[out + 0] = r / c;
-                rgba[out + 1] = g / c;
-                rgba[out + 2] = b / c;
-                rgba[out + 3] = a / c;
+        std::map<std::pair<int, int>, std::vector<HeatmapCell>> masterGrids;
+        int srcPoints = 0;
+        for (unsigned int t = 0; t < numThreads; ++t) {
+            srcPoints += localSrcPoints[t];
+            for (auto& [tID, grid] : localGrids[t]) {
+                auto& masterGrid = masterGrids[tID];
+                if (masterGrid.empty()) {
+                    masterGrid = std::move(grid);
+                } else {
+                    for (size_t i = 0; i < masterGrid.size(); ++i) {
+                        masterGrid[i].sumValue += grid[i].sumValue;
+                        masterGrid[i].sumWeights += grid[i].sumWeights;
+                    }
+                }
             }
         }
 
-        // vertical
-        temp = rgba;
-
-        for (int y = 0; y < kHeatmapTextureSize; ++y)
-        {
-            for (int x = 0; x < kHeatmapTextureSize; ++x)
-            {
-                int r = 0;
-                int g = 0;
-                int b = 0;
-                int a = 0;
-                int c = 0;
-
-                for (int k = -blurRadius;
-                     k <= blurRadius;
-                     ++k)
-                {
-                    int yy = y + k;
-
-                    if (yy < 0 ||
-                        yy >= kHeatmapTextureSize)
-                        continue;
-
-                    int idx =
-                        (yy * kHeatmapTextureSize + x) * 4;
-
-                    r += temp[idx + 0];
-                    g += temp[idx + 1];
-                    b += temp[idx + 2];
-                    a += temp[idx + 3];
-
-                    ++c;
-                }
-
-                int out =
-                    (y * kHeatmapTextureSize + x) * 4;
-
-                rgba[out + 0] = r / c;
-                rgba[out + 1] = g / c;
-                rgba[out + 2] = b / c;
-                rgba[out + 3] = a / c;
-            }
+        if (job->abort.load(std::memory_order_relaxed)) {
+            std::lock_guard<std::mutex> lk(job->mtx);
+            job->statusMsg = "Heatmap: cancelled.";
+            job->done = true;
+            return;
         }
 
-        // =====================================================================
-        // SAVE PNG
-        // =====================================================================
+        if (!outDir.empty()) std::filesystem::create_directories(outDir);
 
-        const std::string path =
-            outDir
-            + "/"
-            + std::to_string(tID.first)
-            + "_"
-            + std::to_string(tID.second)
-            + ".png";
+        std::vector<std::pair<std::pair<int, int>, std::vector<HeatmapCell>>> tileList;
+        tileList.reserve(masterGrids.size());
+        for (auto& item : masterGrids) tileList.push_back(std::move(item));
 
-        stbi_write_png(
-            path.c_str(),
-            kHeatmapTextureSize,
-            kHeatmapTextureSize,
-            4,
-            rgba.data(),
-            kHeatmapTextureSize * 4);
+        std::map<std::pair<int, int>, std::vector<uint8_t>> finalTiles;
+        std::mutex finalTilesMtx;
+        std::atomic<size_t> nextTileIdx{0};
 
-        // =====================================================================
-        // OPENGL
-        // =====================================================================
+        workers.clear();
+        for (unsigned int t = 0; t < numThreads; ++t) {
+            workers.emplace_back([&]() {
+                while (true) {
+                    if (job->abort.load(std::memory_order_relaxed)) break;
 
-        GLuint tex;
+                    size_t idx = nextTileIdx.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= tileList.size()) break;
 
-        glGenTextures(1, &tex);
+                    auto& [tID, grid] = tileList[idx];
+                    std::vector<uint8_t> rgba(1024 * 1024 * 4, 0);
 
-        glBindTexture(GL_TEXTURE_2D, tex);
+                    for (int i = 0; i < 1024 * 1024; ++i) {
+                        if (grid[i].sumWeights < 1e-8) continue;
+                        const double valLinear = grid[i].sumValue / grid[i].sumWeights;
+                        const double val = LinearToMetric(crit, valLinear);
+                        const ImU32 col = ColorForHeatmapValue(crit, val, altMin, altMax);
+                        uint8_t alpha;
+                        if (isAltitude) {
+                            float density = static_cast<float>(grid[i].sumWeights);
+                            density = std::clamp(density * 0.35f, 0.0f, 1.0f);
+                            density = std::pow(density, 0.5f); // Смягчаем кривую угасания
+                            alpha = static_cast<uint8_t>(density * 200.0f);
+                        } else {
+                            float density = static_cast<float>(grid[i].sumWeights);
+                            density = std::min(density * 0.55f, 1.0f);
+                            density = std::pow(density, 0.65f);
+                            alpha = static_cast<uint8_t>(density * 190.0f);
+                        }
 
-        glTexImage2D(
-            GL_TEXTURE_2D,
-            0,
-            GL_RGBA,
-            kHeatmapTextureSize,
-            kHeatmapTextureSize,
-            0,
-            GL_RGBA,
-            GL_UNSIGNED_BYTE,
-            rgba.data());
+                        rgba[i * 4 + 0] = static_cast<uint8_t>((col >> IM_COL32_R_SHIFT) & 0xFF);
+                        rgba[i * 4 + 1] = static_cast<uint8_t>((col >> IM_COL32_G_SHIFT) & 0xFF);
+                        rgba[i * 4 + 2] = static_cast<uint8_t>((col >> IM_COL32_B_SHIFT) & 0xFF);
+                        rgba[i * 4 + 3] = alpha;
+                    }
+                    static constexpr int BR = 2; 
+                    std::vector<uint8_t> tmp = rgba;
+                    for (int y = 0; y < 1024; ++y) {
+                        for (int x = 0; x < 1024; ++x) {
+                            int r = 0, g = 0, b = 0, a = 0, n = 0;
+                            for (int k = -BR; k <= BR; ++k) {
+                                int xx = x + k; if (xx < 0 || xx >= 1024) continue;
+                                const int idx2 = (y * 1024 + xx) * 4;
+                                r += tmp[idx2 + 0]; g += tmp[idx2 + 1]; b += tmp[idx2 + 2]; a += tmp[idx2 + 3]; ++n;
+                            }
+                            const int o = (y * 1024 + x) * 4;
+                            rgba[o + 0] = r / n; rgba[o + 1] = g / n; rgba[o + 2] = b / n; rgba[o + 3] = a / n;
+                        }
+                    }
+                    tmp = rgba;
+                    for (int y = 0; y < 1024; ++y) {
+                        for (int x = 0; x < 1024; ++x) {
+                            int r = 0, g = 0, b = 0, a = 0, n = 0;
+                            for (int k = -BR; k <= BR; ++k) {
+                                int yy = y + k; if (yy < 0 || yy >= 1024) continue;
+                                const int idx2 = (yy * 1024 + x) * 4;
+                                r += tmp[idx2 + 0]; g += tmp[idx2 + 1]; b += tmp[idx2 + 2]; a += tmp[idx2 + 3]; ++n;
+                            }
+                            const int o = (y * 1024 + x) * 4;
+                            rgba[o + 0] = r / n; rgba[o + 1] = g / n; rgba[o + 2] = b / n; rgba[o + 3] = a / n;
+                        }
+                    }
 
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_MIN_FILTER,
-            GL_LINEAR);
+                    if (!outDir.empty()) {
+                        std::string p = outDir + "/" + std::to_string(tID.first) + "_" + std::to_string(tID.second) + ".png";
+                        stbi_write_png(p.c_str(), 1024, 1024, 4, rgba.data(), 1024 * 4);
+                    }
 
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_MAG_FILTER,
-            GL_LINEAR);
+                    {
+                        std::lock_guard<std::mutex> lk2(job->mtx);
+                        job->pendingTiles.push_back({tID, rgba});
+                    }
 
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_S,
-            GL_CLAMP_TO_EDGE);
+                    std::lock_guard<std::mutex> lk(finalTilesMtx);
+                    finalTiles[tID] = std::move(rgba);
+                }
+            });
+        }
 
-        glTexParameteri(
-            GL_TEXTURE_2D,
-            GL_TEXTURE_WRAP_T,
-            GL_CLAMP_TO_EDGE);
+        for (auto& w : workers) {
+            if (w.joinable()) w.join();
+        }
 
-        heatmapTextures[tID] = tex;
-
-        ++heatmapLastTileCount;
-    }
-
-    // =========================================================================
-    // STATUS
-    // =========================================================================
-
-    heatmapStatusMsg =
-        "Heatmap OK: "
-        + std::to_string(heatmapLastSourcePoints)
-        + " points, "
-        + std::to_string(heatmapLastTileCount)
-        + " GIS RF tiles.";
+        std::lock_guard<std::mutex> lk(job->mtx);
+        if (job->abort.load(std::memory_order_relaxed)) {
+            job->statusMsg = "Heatmap: cancelled.";
+        } else {
+            job->finalTiles   = std::move(finalTiles);
+            job->altMin       = altMin;
+            job->altMax       = altMax;
+            job->sourcePoints = srcPoints;
+            job->statusMsg    = "Heatmap OK. Computed in background.";
+        }
+        job->done = true;
+    }).detach();
 }
 
 void MapWindow::DrawPointDetails(const PointItem& p) {
@@ -1028,7 +810,7 @@ void MapWindow::DrawLegend() {
         ImGui::SameLine(stepX * 3 - 15); ImGui::Text("-80");
         ImGui::SameLine(p1.x - p0.x - 30); ImGui::Text(">-80");
     } else if (c == HeatmapCriterion::RSRQ) {
-        ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "RSRQ (dB), лучше ближе к 0");
+        ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 1.0f), "RSRQ (dB)");
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImVec2 p1 = ImVec2(p0.x + ImGui::GetContentRegionAvail().x, p0.y + 20);
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
@@ -1055,13 +837,28 @@ void MapWindow::DrawLegend() {
         ImVec2 p0 = ImGui::GetCursorScreenPos();
         ImVec2 p1 = ImVec2(p0.x + ImGui::GetContentRegionAvail().x, p0.y + 20);
         ImDrawList* draw_list = ImGui::GetWindowDrawList();
-        draw_list->AddRectFilledMultiColor(p0, p1,
-            IM_COL32(0, 80, 200, 255), IM_COL32(0, 200, 200, 255),
-            IM_COL32(255, 200, 60, 255), IM_COL32(255, 60, 40, 255));
+        
+        const int segs = 6;
+        const float wStep = (p1.x - p0.x) / segs;
+        const ImU32 altColors[] = {
+            IM_COL32(0, 190, 255, 255),   // Cyan
+            IM_COL32(40, 232, 90, 255),   // Green
+            IM_COL32(140, 237, 20, 255),  // Lime/Yellow
+            IM_COL32(255, 195, 0, 255),   // Amber
+            IM_COL32(255, 105, 0, 255),   // Orange
+            IM_COL32(255, 25, 10, 255),   // Red
+            IM_COL32(255, 200, 200, 255)  // White/Pink
+        };
+        for (int i = 0; i < segs; i++) {
+            ImVec2 rMin(p0.x + i * wStep, p0.y);
+            ImVec2 rMax(p0.x + (i + 1) * wStep, p1.y);
+            draw_list->AddRectFilledMultiColor(rMin, rMax, altColors[i], altColors[i + 1], altColors[i + 1], altColors[i]);
+        }
+
         ImGui::Dummy(ImVec2(0, 25));
-        ImGui::Text("min: %.1f", heatmapLastAltMin);
-        ImGui::SameLine();
-        ImGui::Text("max: %.1f", heatmapLastAltMax);
+        ImGui::Text("min: %.1f m", heatmapLastAltMin);
+        ImGui::SameLine(ImGui::GetContentRegionAvail().x - 100);
+        ImGui::Text("max: %.1f m", heatmapLastAltMax);
     }
 }
 
@@ -1122,7 +919,6 @@ double tileWorldY =
 float sxf = canvasPos.x + float(tileWorldX * currentScale - originPx.x);
 float syf = canvasPos.y + float(tileWorldY * currentScale - originPx.y);
 
-// Ceil для начала и floor+1 для конца — тайлы перекрываются на 1px, зазоры исчезают
 float sx = std::floor(sxf);
 float sy = std::floor(syf);
 float ex = std::floor(sxf + renderSize) + 1.0f;
@@ -1148,16 +944,12 @@ dl->AddImage((ImTextureID)(intptr_t)tex, ImVec2(sx, sy), ImVec2(ex, ey),
         if (sx < canvasPos.x - 20.0f || sx > canvasMax.x + 20.0f ||
             sy < canvasPos.y - 20.0f || sy > canvasMax.y + 20.0f) continue;
 
-// Применяем фильтр КО ВСЕМ ТОЧКАМ (не только к Heatmap)
         bool pointVisible = PointMatchesHeatmapFilter(p);
         if (!pointVisible) continue;
 
         if (!useHeatmap) {
             const float radius = SignalToRadius(p.signalValue);
             const ImU32 fill = ColorForHeatmapValue(HeatmapCriterion::RSRP, p.signalValue, 0.0, 1.0);
-            
-            // Используем 6 сегментов вместо 16! Это в 3 раза снизит нагрузку на OpenGL/CPU
-            // при отрисовке десятков тысяч кружков, избавив от лагов интерфейса.
             dl->AddCircleFilled(ImVec2(sx, sy), radius, fill, 6);
             dl->AddCircle(ImVec2(sx, sy), radius, IM_COL32(0, 0, 0, 255), 6, 1.0f);
         }
@@ -1195,6 +987,9 @@ dl->AddImage((ImTextureID)(intptr_t)tex, ImVec2(sx, sy), ImVec2(ex, ey),
 }
 
 void MapWindow::Render() {
+    EnsureHeatmapReady();
+    UploadPendingHeatmapTiles();
+
     if (!open) return;
     ImGuiIO& io = ImGui::GetIO();
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse;
@@ -1209,9 +1004,12 @@ void MapWindow::Render() {
     if (ImGui::Button("Reload Points")) Reload();
     ImGui::SameLine();
 
+    const bool computing = (heatmapJob != nullptr);
+    if (computing) ImGui::BeginDisabled();
     if (ImGui::Button("Regenerate Heatmap Cache")) {
         GenerateHeatmapTiles();
     }
+    if (computing) ImGui::EndDisabled();
     ImGui::SameLine();
 
     if (ImGui::Button("Fit all")) needFit = true;
@@ -1228,7 +1026,9 @@ void MapWindow::Render() {
     ImGui::SameLine();
     ImGui::Checkbox("Follow latest", &followLatest);
     ImGui::SameLine();
-    ImGui::Checkbox("Layer: Heatmap", &useHeatmap);
+    if (ImGui::Checkbox("Layer: Heatmap", &useHeatmap)) {
+        if (useHeatmap) EnsureHeatmapReady();
+    }
     ImGui::SameLine();
     ImGui::SliderInt("Zoom", &zoom, kMinZoom, kMaxZoom);
     ImGui::PopStyleVar();
@@ -1297,7 +1097,13 @@ if (!heatmapPciChoices.empty()) {
         if (heatmapTextures.empty()) GenerateHeatmapTiles();
     }
 
-    if (!heatmapStatusMsg.empty()) {
+    if (computing) {
+        static const char* spinner[] = {"|", "/", "-", "\\"};
+        const int frame = static_cast<int>(ImGui::GetTime() * 6.0) & 3;
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.2f, 1.0f),
+                           "%s Computing heatmap in background...", spinner[frame]);
+    } else if (!heatmapStatusMsg.empty()) {
         const bool ok = heatmapStatusMsg.rfind("Heatmap OK", 0) == 0;
         ImGui::TextColored(ok ? ImVec4(0.4f, 0.9f, 0.5f, 1.0f) : ImVec4(1.0f, 0.55f, 0.35f, 1.0f),
                            "%s", heatmapStatusMsg.c_str());
@@ -1406,3 +1212,4 @@ if (!heatmapPciChoices.empty()) {
     }
     ImGui::End();
 }
+

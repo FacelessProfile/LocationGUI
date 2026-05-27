@@ -5,6 +5,10 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <atomic>
+#include <deque>
+#include <thread>
+#include <memory>
 
 #include "imgui.h"
 #include "headers/data.h"
@@ -42,6 +46,20 @@ private:
         double sumWeights = 0.0;
     };
 
+    struct HeatmapAsyncJob {
+        std::deque<std::pair<std::pair<int,int>, std::vector<uint8_t>>> pendingTiles;
+        std::atomic<bool> abort{false};
+        std::mutex        mtx;
+        bool              done = false;
+
+        std::map<std::pair<int, int>, std::vector<uint8_t>> finalTiles;
+
+        double            altMin = 0.0;
+        double            altMax = 1.0;
+        int               sourcePoints = 0;
+        std::string       statusMsg;
+    };
+
     Loader loader;
     MapManager tiles;
     std::vector<PointItem> points;
@@ -75,6 +93,8 @@ private:
     int heatmapLastTileCount = 0;
     std::string heatmapStatusMsg;
 
+    std::shared_ptr<HeatmapAsyncJob> heatmapJob;
+
     void BuildPoints(const std::vector<TelemetryData>& raw);
     void RefreshHeatmapComboLists();
     void FitToData(const ImVec2& canvasSize);
@@ -82,6 +102,7 @@ private:
 
     std::string HeatmapCacheDir() const;
     void GenerateHeatmapTiles();
+    void UploadPendingHeatmapTiles();
     void LoadHeatmapTiles();
     void ClearHeatmapTextures();
 

@@ -149,7 +149,7 @@ void RunNetworkModule(SharedBuffer& shared_buffer, std::atomic<bool>& should_run
             std::string net_type = tokens[5];
             std::string band, cell_id, pci, tac, mcc, mnc, rsrp, rsrq, rssi, snr, cqi;
 
-            // Корректный маппинг в зависимости от типа сети
+            // маппинг в зависимости от типа сети
             if (net_type == "LTE" && tokens.size() >= 19) {
                 band = tokens[6]; cell_id = tokens[7]; 
                 mcc = tokens[9]; mnc = tokens[10]; pci = tokens[11]; tac = tokens[12];

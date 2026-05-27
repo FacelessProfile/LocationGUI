@@ -7,6 +7,7 @@
 void RunGui(SharedBuffer& shared_data, std::atomic<bool>& running);
 void RunNetworkModule(SharedBuffer& shared_buffer, std::atomic<bool>& should_run);
 std::vector<TelemetryData> FetchInitialData();
+std::vector<TelemetryData> FetchMapData();
 
 int main(int argc, char* argv[]) {
     SharedBuffer sharedData;
@@ -22,6 +23,10 @@ int main(int argc, char* argv[]) {
     } else {
         std::cout << "[БД] История пуста или база недоступна" << std::endl;
     }
+    std::cout << "[БД] Загрузка 10 000 точек для карты..." << std::endl;
+    std::vector<TelemetryData> map_history = FetchMapData();
+    if (!map_history.empty()) sharedData.setMapData(map_history);
+    
     std::cout << "[СЕТЬ] Запуск потока ZMQ..." << std::endl;
     std::thread netThread(RunNetworkModule, std::ref(sharedData), std::ref(running));
     std::cout << "[GUI] Инициализация интерфейса..." << std::endl;
